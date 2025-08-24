@@ -8,6 +8,7 @@ from html import escape
 ASSEMBLIES_DIR = Path("Assemblies")
 OUT_DIR = Path("Coverage_HTML")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+GENOMES_DIR = Path("genomes")
 
 RED = "#8b0000"  # darkred, similar to your screenshot
 
@@ -29,6 +30,11 @@ hr {{ border: none; border-top: 1px solid #eee; margin: 1.25rem 0; }}
 a {{ color: #0b6; text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
 .badge {{ display:inline-block; background:#eef; color:#225; border:1px solid #dde; border-radius:8px; padding:0 .5rem; margin-left:.5rem; font-size:.8rem; }}
+.detail-body {{ display:flex; gap:1rem; align-items:flex-start; }}
+.hist {{ flex:1; }}
+.blast-table {{ border-collapse:collapse; }}
+.blast-table th, .blast-table td {{ border:1px solid #ddd; padding:0.25rem 0.5rem; text-align:right; }}
+.blast-table th {{ background:#4caf50; color:white; }}
 """
 
 def run(cmd, check=True, capture=True, text=True):
@@ -73,8 +79,39 @@ def hist_for_contig(bam: Path, contig: str) -> str:
     # -A (count all), --hist (ASCII), -w 32 (bin count), -r contig
     return run(f"samtools coverage -A --hist -w 50 -r {shlex.quote(contig)} {bam}")
 
+def blastn_stats(query: Path, subject: Path) -> dict | None:
+    fmt = "6 pident length evalue bitscore qcovs scovs"
+    try:
+        out = run(f"blastn -query {query} -subject {subject} -outfmt '{fmt}'")
+    except FileNotFoundError:
+        print("⚠️ blastn not found; skipping BLAST stats")
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ blastn failed for {query} vs {subject}: {e}")
+        return None
+    if not out.strip():
+        return None
+    vals = out.splitlines()[0].split('\t')
+    pident, length, evalue, bitscore, qcovs, scovs = vals
+    pident = float(pident)
+    length = int(float(length))
+    evalue = float(evalue)
+    bitscore = float(bitscore)
+    qcovs = float(qcovs)
+    scovs = float(scovs)
+    combined = pident * qcovs / 100
+    return {
+        "pident": pident,
+        "length": length,
+        "evalue": evalue,
+        "bitscore": bitscore,
+        "qcovs": qcovs,
+        "scovs": scovs,
+        "combined": combined,
+    }
+
 def write_sample_page(sample: str, items: list[dict]):
-    # items: list of dicts with keys: virus, contig, mean_cov, hist
+    # items: list of dicts with keys: virus, contig, mean_cov, hist, blast
     # sort by mean_cov desc
     items.sort(key=lambda d: d["mean_cov"], reverse=True)
 
@@ -92,11 +129,28 @@ def write_sample_page(sample: str, items: list[dict]):
         title = f"{it['virus']} <span class='badge'>contig: {escape(it['contig'])}</span> <span class='badge'>mean: {it['mean_cov']:.2f}</span>"
         html.append("<div class='details'>")
         html.append(f"<h3>{title}</h3>")
-        html.append("<pre>")
+        html.append("<div class='detail-body'>")
+        html.append("<pre class='hist'>")
         html.append(escape(it["hist"]))
         html.append("</pre>")
+        blast = it.get("blast")
+        if blast:
+            html.append("<table class='blast-table'><thead><tr>" +
+                        "<th>%IDENTITY</th><th>ALIGN-LENGTH</th><th>E-VALUE</th>" +
+                        "<th>BIT-SCORE</th><th>%QUERY</th><th>%SUBJECT</th><th>%COMBINED</th>" +
+                        "</tr></thead><tbody>")
+            html.append("<tr>" +
+                        f"<td>{blast['pident']:.1f}</td>" +
+                        f"<td>{blast['length']}</td>" +
+                        f"<td>{blast['evalue']:.1e}</td>" +
+                        f"<td>{blast['bitscore']:.1f}</td>" +
+                        f"<td>{blast['qcovs']:.1f}</td>" +
+                        f"<td>{blast['scovs']:.1f}</td>" +
+                        f"<td>{blast['combined']:.1f}</td>" +
+                        "</tr></tbody></table>")
+        html.append("</div>")
         html.append("</div><hr>")
-    html.append(f"<p class='meta'>Made with <code>samtools coverage --hist</code>. Color/style only for readability; numbers are unmodified from samtools.</p>")
+    html.append(f"<p class='meta'>Made with <code>samtools coverage --hist</code> and <code>blastn</code> (when available). Color/style only for readability; numbers are unmodified from tools.</p>")
     html.append("</body></html>")
     out_path = OUT_DIR / f"{sample}.html"
     out_path.write_text("\n".join(html))
@@ -135,12 +189,21 @@ def main():
             if mean_cov is None:
                 continue
             hist = hist_for_contig(bam, contig)
+            consensus = bam.with_suffix('.fa')
+            ref = GENOMES_DIR / f"{virus}.fasta"
+            blast = None
+            if consensus.exists() and ref.exists():
+                blast = blastn_stats(consensus, ref)
         except subprocess.CalledProcessError as e:
             print(f"⚠️ skipping {bam} due to error: {e}")
             continue
 
         per_sample.setdefault(sample, []).append({
-            "virus": virus, "contig": contig, "mean_cov": float(mean_cov), "hist": hist
+            "virus": virus,
+            "contig": contig,
+            "mean_cov": float(mean_cov),
+            "hist": hist,
+            "blast": blast,
         })
 
     # Write pages
